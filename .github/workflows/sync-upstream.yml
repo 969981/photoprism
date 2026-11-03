@@ -1,0 +1,76 @@
+name: PhotoPrism upstream sync
+
+on:
+  push:
+    branches:
+      - 'arch/armv7'
+    paths:
+      - '.github/workflows/sync-upstream.yml'
+  schedule:
+    - cron: '23 */3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: photoprism-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == '969981/photoprism'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fast-forward fork develop safely
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add official https://github.com/photoprism/photoprism.git
+          git fetch --no-tags official refs/heads/develop:refs/remotes/official/develop
+          git fetch --no-tags origin refs/heads/develop:refs/remotes/origin/develop
+          latest="$(git rev-parse refs/remotes/official/develop)"
+          current="$(git rev-parse refs/remotes/origin/develop)"
+          echo "Official: $latest / Fork: $current"
+          if [[ "$latest" != "$current" ]]; then
+            git merge-base --is-ancestor "$current" "$latest" || {
+              echo "::error::Fork develop diverged; refusing to overwrite custom commits."
+              exit 1
+            }
+            git push origin "$latest:refs/heads/develop"
+          fi
+          previous="$(git ls-remote --heads origin refs/heads/photoprism-autosync-state | awk '{print $1}')"
+          echo "sha=$latest" >> "$GITHUB_OUTPUT"
+          if [[ "$latest" == "$previous" ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Trigger Linux AMD64 and ARM64 releases
+        if: steps.upstream.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.upstream.outputs.sha }}
+        run: |
+          set -euo pipefail
+          gh workflow run build-release.yml --repo "$GITHUB_REPOSITORY" --ref 'arch/armv7' -f source_sha="$SHA"
+
+      - name: Record dispatched upstream revision
+        if: steps.upstream.outputs.changed == 'true'
+        env:
+          SHA: ${{ steps.upstream.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git push origin "$SHA:refs/heads/photoprism-autosync-state"
+          echo "Dispatched build for $SHA" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: No changes
+        if: steps.upstream.outputs.changed != 'true'
+        run: echo "No source changes since previous dispatch." >> "$GITHUB_STEP_SUMMARY"
